@@ -70,13 +70,14 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISC:
             ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
             
-            // RADAR MODE: Cetak semua nama perangkat Bluetooth yang terdeteksi
+            // HANYA proses jika perangkat memancarkan Nama
             if (fields.name_len > 0) {
-                printf("Radar Scan melihat: %.*s\n", fields.name_len, fields.name);
-                
-                // Cari berdasarkan Nama, BUKAN UUID (Lebih akurat untuk Node kita)
                 if (strncmp((char*)fields.name, "SHM_Node_C3", fields.name_len) == 0) {
-                    printf("\n=== NODE SHM_Node_C3 DITEMUKAN! Memulai Koneksi... ===\n");
+                    printf("\n[GATEWAY] Target 'SHM_Node_C3' Ditemukan! (MAC: %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                           event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
+                           event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0]);
+                    
+                    printf("[GATEWAY] Menghentikan scan & memulai koneksi...\n");
                     ble_gap_disc_cancel();
                     ble_gap_connect(own_addr_type, &event->disc.addr, 30000, NULL, ble_gap_event_cb, NULL);
                     return 0;
