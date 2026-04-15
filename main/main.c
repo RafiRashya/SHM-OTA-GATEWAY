@@ -13,15 +13,16 @@
 #include "services/gap/ble_svc_gap.h"
 
 // ================= PENGATURAN JARINGAN =================
-#define WIFI_SSID "Wifi-nya Rachelle"
-#define WIFI_PASS "minimaltaudiri"
-#define FIRMWARE_URL "http://192.168.100.184:5000/firmware/download/nimble-shm-ota.bin"
+#define WIFI_SSID "ye"
+#define WIFI_PASS "gataulupa"
+#define FIRMWARE_URL "http://10.62.28.109:5000/firmware/download/nimble-shm-ota.bin"
 
 // ================= STRUKTUR DATA SHM ===================
 typedef struct __attribute__((packed)) {
     float ax;
     float ay;
     float az;
+    float vbatt;
 } SHMData;
 
 // === UUID BLE ===
@@ -221,10 +222,14 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             if (event->notify_rx.attr_handle == notify_char_val_handle) {
                 SHMData shm;
                 uint16_t data_len = OS_MBUF_PKTLEN(event->notify_rx.om);
-                if (data_len == sizeof(SHMData)) {
+                
+                // Pengecekan sizeof(SHMData) sekarang otomatis bernilai 16 byte
+                if (data_len == sizeof(SHMData)) { 
                     os_mbuf_copydata(event->notify_rx.om, 0, sizeof(SHMData), &shm);
-                    // Print data SHM (Akan terus mengalir walau OTA sudah selesai)
-                    printf("[SHM] AX:%.2f AY:%.2f AZ:%.2f\n", shm.ax, shm.ay, shm.az);
+                    
+                    // Print data SHM ditambahkan dengan Vbatt
+                    printf("[SHM] AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
+                           shm.ax, shm.ay, shm.az, shm.vbatt);
                 }
             }
             break;
