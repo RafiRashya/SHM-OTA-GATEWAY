@@ -6,6 +6,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "mqtt_client.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -13,9 +14,15 @@
 #include "services/gap/ble_svc_gap.h"
 
 // ================= PENGATURAN JARINGAN =================
-#define WIFI_SSID "ye"
-#define WIFI_PASS "gataulupa"
-#define FIRMWARE_URL "http://10.62.28.109:5000/firmware/download/nimble-shm-ota.bin"
+#define WIFI_SSID "Wifi-nya Rachelle"
+#define WIFI_PASS "minimaltaudiri"
+#define FIRMWARE_URL "http://192.168.100.184:5000/api/v1/firmware/download?version=1.0.1"
+
+// ================= PENGATURAN MQTT =================
+#define MQTT_BROKER_URI "mqtts://f61f146a.ala.asia-southeast1.emqxsl.com:8883" 
+#define MQTT_USERNAME   "rafirashya" // Username dari menu Authentication EMQX
+#define MQTT_PASSWORD   "broker123" // Password dari menu Authentication EMQX
+#define MQTT_TOPIC      "shm/node1/data" // Topik untuk publish
 
 // ================= STRUKTUR DATA SHM ===================
 typedef struct __attribute__((packed)) {
@@ -24,6 +31,33 @@ typedef struct __attribute__((packed)) {
     float az;
     float vbatt;
 } SHMData;
+
+const char *emqx_ca_cert = 
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh"
+    "MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n"
+    "d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH\n"
+    "MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT\n"
+    "MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n"
+    "b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG\n"
+    "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI\n"
+    "2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx\n"
+    "1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ\n"
+    "q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz\n"
+    "tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ\n"
+    "vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP\n"
+    "BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV\n"
+    "5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY\n"
+    "1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4\n"
+    "NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG\n"
+    "Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91\n"
+    "8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe\n"
+    "pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl\n"
+    "MrY=\n"
+    "-----END CERTIFICATE-----";
+
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+static bool mqtt_connected = false;
 
 // === UUID BLE ===
 static ble_uuid_any_t shm_svc_uuid;
@@ -49,6 +83,47 @@ static bool ota_sudah_dilakukan = false; // Mencegah OTA berulang-ulang (Loop ma
 
 static void ble_app_scan(void);
 static void check_and_start_ota(void);
+
+// Callback Event MQTT
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            printf("\n[MQTT] Terhubung secara AMAN (TLS) ke EMQX!\n");
+            mqtt_connected = true;
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            printf("[MQTT] Terputus. Mengecek sertifikat atau koneksi...\n");
+            mqtt_connected = false;
+            break;
+        case MQTT_EVENT_ERROR:
+            // Sangat berguna untuk debugging TLS
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_ESP_TLS) {
+                printf("[MQTT] TLS Error: 0x%x\n", event->error_handle->esp_tls_last_esp_err);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// Fungsi Memulai MQTT
+static void mqtt_app_start(void) {
+    const esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address.uri = MQTT_BROKER_URI,
+            .verification.certificate = (const char *)emqx_ca_cert, // Menggunakan sertifikat CA
+        },
+        .credentials = {
+            .username = MQTT_USERNAME,
+            .authentication.password = MQTT_PASSWORD,
+        },
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
 
 // ==================== TASK OTA STREAMING ====================
 void ota_download_and_send_task(void *pvParameters) {
@@ -230,6 +305,17 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                     // Print data SHM ditambahkan dengan Vbatt
                     printf("[SHM] AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
                            shm.ax, shm.ay, shm.az, shm.vbatt);
+                    
+                    if (mqtt_connected) {
+                        char json_payload[128];
+                        // Susun string JSON
+                        snprintf(json_payload, sizeof(json_payload), 
+                                 "{\"ax\":%.2f, \"ay\":%.2f, \"az\":%.2f, \"vbatt\":%.2f}", 
+                                 shm.ax, shm.ay, shm.az, shm.vbatt);
+                        
+                        // Publish dengan QoS 1 agar dijamin sampai ke broker
+                        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_payload, 0, 1, 0);
+                    }
                 }
             }
             break;
@@ -281,6 +367,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         printf("[WIFI] Terhubung! IP Address: " IPSTR "\n", IP2STR(&event->ip_info.ip));
         wifi_connected = true;
+        if (mqtt_client == NULL) {
+            mqtt_app_start();
+        }
         check_and_start_ota();
     }
 }
