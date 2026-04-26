@@ -12,17 +12,18 @@
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
+#include "cJSON.h"
 
 // ================= PENGATURAN JARINGAN =================
-#define WIFI_SSID "Wifi-nya Rachelle"
-#define WIFI_PASS "minimaltaudiri"
-#define FIRMWARE_URL "http://192.168.100.184:5000/api/v1/firmware/download?version=1.0.1"
+#define WIFI_SSID "ye"
+#define WIFI_PASS "gataulupa"
 
 // ================= PENGATURAN MQTT =================
 #define MQTT_BROKER_URI "mqtts://f61f146a.ala.asia-southeast1.emqxsl.com:8883" 
 #define MQTT_USERNAME   "rafirashya" // Username dari menu Authentication EMQX
 #define MQTT_PASSWORD   "broker123" // Password dari menu Authentication EMQX
 #define MQTT_TOPIC      "shm/node1/data" // Topik untuk publish
+char current_ota_url[256] = "";
 
 // ================= STRUKTUR DATA SHM ===================
 typedef struct __attribute__((packed)) {
@@ -91,13 +92,53 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             printf("\n[MQTT] Terhubung secara AMAN (TLS) ke EMQX!\n");
             mqtt_connected = true;
+            
+            // --- SUBSCRIBE KE TOPIK TRIGGER ---
+            esp_mqtt_client_subscribe(mqtt_client, "shm/ota/trigger", 1);
+            printf("[MQTT] Berlangganan ke topik: shm/ota/trigger\n");
             break;
+
+        case MQTT_EVENT_DATA:
+            // --- MENANGKAP PESAN MASUK ---
+            if (strncmp(event->topic, "shm/ota/trigger", event->topic_len) == 0) {
+                // Salin payload ke string dengan null-terminator agar aman diparse
+                char *json_str = malloc(event->data_len + 1);
+                memcpy(json_str, event->data, event->data_len);
+                json_str[event->data_len] = '\0';
+
+                // Parsing JSON menggunakan cJSON
+                cJSON *root = cJSON_Parse(json_str);
+                if (root != NULL) {
+                    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+                    cJSON *url = cJSON_GetObjectItem(root, "url");
+                    
+                    // Cek apakah perintahnya "start_ota"
+                    if (cmd && cJSON_IsString(cmd) && strcmp(cmd->valuestring, "start_ota") == 0) {
+                        if (url && cJSON_IsString(url)) {
+                            // Simpan URL baru ke variabel global
+                            strncpy(current_ota_url, url->valuestring, sizeof(current_ota_url)-1);
+                            printf("\n[MQTT] TRIGGER OTA DITERIMA! URL: %s\n", current_ota_url);
+                            
+                            // Buka gembok OTA agar bisa berjalan lagi
+                            ota_sudah_dilakukan = false; 
+                            
+                            // Panggil fungsi trigger OTA
+                            check_and_start_ota();
+                        }
+                    }
+                    cJSON_Delete(root);
+                } else {
+                    printf("[MQTT] Gagal parse JSON\n");
+                }
+                free(json_str);
+            }
+            break;
+            
         case MQTT_EVENT_DISCONNECTED:
             printf("[MQTT] Terputus. Mengecek sertifikat atau koneksi...\n");
             mqtt_connected = false;
             break;
         case MQTT_EVENT_ERROR:
-            // Sangat berguna untuk debugging TLS
             if (event->error_handle->error_type == MQTT_ERROR_TYPE_ESP_TLS) {
                 printf("[MQTT] TLS Error: 0x%x\n", event->error_handle->esp_tls_last_esp_err);
             }
@@ -137,7 +178,7 @@ void ota_download_and_send_task(void *pvParameters) {
 
     // 2. Siapkan HTTP Client
     esp_http_client_config_t config = {
-        .url = FIRMWARE_URL,
+        .url = current_ota_url,
         .method = HTTP_METHOD_GET,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -333,8 +374,14 @@ static void ble_app_scan(void) {
 // Fungsi untuk mengecek apakah semua syarat OTA sudah terpenuhi
 static void check_and_start_ota(void) {
     if (wifi_connected && ota_ctrl_handle != 0 && ota_data_handle != 0 && !ota_in_progress && !ota_sudah_dilakukan) {
-        printf("\n[SYSTEM] Wi-Fi dan BLE OTA siap! Memulai Task OTA...\n");
-        xTaskCreate(ota_download_and_send_task, "ota_task", 8192, NULL, 5, NULL);
+        
+        // --- TAMBAHKAN SYARAT URL ---
+        if (strlen(current_ota_url) > 0) { 
+            printf("\n[SYSTEM] Wi-Fi, BLE, dan URL Siap! Memulai Task OTA...\n");
+            xTaskCreate(ota_download_and_send_task, "ota_task", 8192, NULL, 5, NULL);
+        } else {
+            printf("[SYSTEM] Koneksi Node Siap, menunggu Trigger URL dari MQTT...\n");
+        }
     }
 }
 
@@ -388,6 +435,11 @@ void wifi_init_sta(void) {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK, 
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
         },
     };
     esp_wifi_set_mode(WIFI_MODE_STA);
