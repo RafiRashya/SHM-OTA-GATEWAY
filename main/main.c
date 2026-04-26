@@ -6,6 +6,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "mqtt_client.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -13,17 +14,9 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "cJSON.h"
+#include "secrets.h"
 
-// ================= PENGATURAN JARINGAN =================
-#define WIFI_SSID "ye"
-#define WIFI_PASS "gataulupa"
-
-// ================= PENGATURAN MQTT =================
-#define MQTT_BROKER_URI "mqtts://f61f146a.ala.asia-southeast1.emqxsl.com:8883" 
-#define MQTT_USERNAME   "rafirashya" // Username dari menu Authentication EMQX
-#define MQTT_PASSWORD   "broker123" // Password dari menu Authentication EMQX
-#define MQTT_TOPIC      "shm/node1/data" // Topik untuk publish
-char current_ota_url[256] = "";
+char current_ota_url[1024] = "";
 
 // ================= STRUKTUR DATA SHM ===================
 typedef struct __attribute__((packed)) {
@@ -33,29 +26,6 @@ typedef struct __attribute__((packed)) {
     float vbatt;
 } SHMData;
 
-const char *emqx_ca_cert = 
-    "-----BEGIN CERTIFICATE-----\n"
-    "MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh"
-    "MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n"
-    "d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH\n"
-    "MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT\n"
-    "MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n"
-    "b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG\n"
-    "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI\n"
-    "2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx\n"
-    "1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ\n"
-    "q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz\n"
-    "tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ\n"
-    "vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP\n"
-    "BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV\n"
-    "5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY\n"
-    "1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4\n"
-    "NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG\n"
-    "Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91\n"
-    "8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe\n"
-    "pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl\n"
-    "MrY=\n"
-    "-----END CERTIFICATE-----";
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
@@ -174,12 +144,16 @@ void ota_download_and_send_task(void *pvParameters) {
     // 1. Kirim Perintah START (0x01) ke Node
     uint8_t cmd_start = 0x01;
     ble_gattc_write_flat(target_conn_handle, ota_ctrl_handle, &cmd_start, 1, NULL, NULL);
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Beri waktu Node menghapus flash
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     // 2. Siapkan HTTP Client
     esp_http_client_config_t config = {
         .url = current_ota_url,
         .method = HTTP_METHOD_GET,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size = 8192,
+        .buffer_size_tx = 2048,
+        .timeout_ms = 10000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_err_t err = esp_http_client_open(client, 0);
