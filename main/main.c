@@ -36,6 +36,7 @@ typedef struct {
     uint16_t notify_handle;
     uint16_t ota_ctrl_handle;
     uint16_t ota_data_handle;
+    uint16_t ota_ver_handle; // Ditambahkan untuk menyimpan handle versi
     bool is_active;
     bool ota_in_progress;
 } ConnectedNode;
@@ -112,6 +113,15 @@ static int read_version_cb(uint16_t conn_handle, const struct ble_gatt_error *er
         }
     }
     return 0;
+}
+
+// ==================== TASK VERIFIKASI (Mencegah Tabrakan GATT) ====================
+void verify_version_task(void *pvParameter) {
+    int idx = (int)pvParameter;
+    // Tunggu 2 detik agar proses Subscribe CCCD dari on_disc_dsc selesai sepenuhnya
+    vTaskDelay(pdMS_TO_TICKS(2000)); 
+    ble_gattc_read(nodes[idx].conn_handle, nodes[idx].ota_ver_handle, read_version_cb, NULL);
+    vTaskDelete(NULL);
 }
 
 // ==================== MQTT HANDLER ====================
@@ -193,7 +203,7 @@ static void mqtt_app_start(void) {
     esp_mqtt_client_start(mqtt_client);
 }
 
-// ==================== TASK OTA STREAMING (PURE KODE LAMA) ====================
+// ==================== TASK OTA STREAMING (48 DETIK) ====================
 void ota_download_and_send_task(void *pvParameters) {
     int idx = *((int*)pvParameters);
     free(pvParameters);
@@ -202,12 +212,8 @@ void ota_download_and_send_task(void *pvParameters) {
     publish_ota_status(nodes[idx].mac_address, "IN_PROGRESS");
     printf("\n[GATEWAY OTA] Memulai proses Streaming dari Server ke Node %s...\n", nodes[idx].mac_address);
 
-    // =========================================================================
-    // KUNCI JAWABAN: Hentikan Scanning BLE agar Radio 100% fokus untuk OTA!
-    // =========================================================================
     printf("[GATEWAY OTA] Mematikan background scanner sementara...\n");
     ble_gap_disc_cancel(); 
-    // =========================================================================
 
     uint8_t cmd_start = 0x01;
     ble_gattc_write_flat(nodes[idx].conn_handle, nodes[idx].ota_ctrl_handle, &cmd_start, 1, NULL, NULL);
@@ -253,19 +259,15 @@ void ota_download_and_send_task(void *pvParameters) {
             }
 
             total_sent += data_read;
-            bytes_since_last_pause += data_read; // Tambahkan data ke akumulator
+            bytes_since_last_pause += data_read; 
             
-            // LOGIKA PENGEREMAN TAHAN BANTING
-            // Jika akumulator sudah menyentuh 4KB (4096), beri jeda Flash Write
             if (bytes_since_last_pause >= 4096) {
                 vTaskDelay(pdMS_TO_TICKS(150)); 
-                bytes_since_last_pause -= 4096; // Kurangi akumulator, jangan di-nol-kan
+                bytes_since_last_pause -= 4096; 
             } else {
-                // Karena radio 100% fokus, kita bisa tekan delay per-paket menjadi 15ms!
                 vTaskDelay(pdMS_TO_TICKS(15));  
             }
             
-            // Cetak log progress setiap ~10KB (dikali kelipatan 500)
             if (total_sent % 10000 < sizeof(buffer)) {
                 printf("[GATEWAY OTA] Progres: %d / %d bytes...\n", total_sent, total_len);
             }
@@ -298,12 +300,8 @@ void ota_download_and_send_task(void *pvParameters) {
     esp_http_client_cleanup(client);
     nodes[idx].ota_in_progress = false;
 
-    // =========================================================================
-    // Nyalakan kembali background scanner setelah OTA selesai/gagal
-    // =========================================================================
     printf("[GATEWAY OTA] OTA Selesai. Menyalakan kembali BLE Scanner...\n");
     ble_app_scan();
-    // =========================================================================
 
     vTaskDelete(NULL);
 }
@@ -313,6 +311,8 @@ static int on_disc_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg) {
     if (error->status == 0) {
         if (ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
+            // KEMBALIKAN LOG PRINTF SUBSCRIBE!
+            printf(">> Mengaktifkan Notifikasi SHM (Subscribe)...\n"); 
             uint8_t value[2] = {0x01, 0x00};
             ble_gattc_write_flat(conn_handle, dsc->handle, value, sizeof(value), NULL, NULL);
         }
@@ -336,9 +336,9 @@ static int on_disc_chr(uint16_t conn_handle, const struct ble_gatt_error *error,
         else if (ble_uuid_cmp(&chr->uuid.u, &ota_chr_data_uuid.u) == 0) {
             nodes[idx].ota_data_handle = chr->val_handle;
         }
-        // PEMBACAAN VERSI SECARA AMAN DILAKUKAN DI SINI
         else if (ble_uuid_cmp(&chr->uuid.u, &ota_chr_ver_uuid.u) == 0) {
-            ble_gattc_read(conn_handle, chr->val_handle, read_version_cb, NULL);
+            // SIMPAN HANDLE SAJA DI SINI. JANGAN LANGSUNG DIBACA!
+            nodes[idx].ota_ver_handle = chr->val_handle; 
         }
     }
     return 0;
@@ -387,9 +387,13 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                              
                     printf("\n=== KONEKSI BLE BERHASIL! Node MAC: %s di slot %d ===\n", nodes[empty_idx].mac_address, empty_idx);
 
-                    // --- KONEKSI SANGAT BERSIH SEPERTI KODE LAMA ---
                     ble_gattc_exchange_mtu(event->connect.conn_handle, NULL, NULL);
                     ble_gattc_disc_all_svcs(event->connect.conn_handle, on_disc_svc, NULL);
+                    
+                    // TRIGGER TASK PEMBACAAN VERSI JIKA SEDANG VALIDASI OTA
+                    if (strlen(verifying_mac) > 0 && strcmp(nodes[empty_idx].mac_address, verifying_mac) == 0) {
+                        xTaskCreate(verify_version_task, "verify_task", 2048, (void*)empty_idx, 5, NULL);
+                    }
                 } else {
                     printf(">> Kapasitas Gateway Penuh! Memutus koneksi...\n");
                     ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -410,23 +414,31 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             ble_app_scan();
             break;
 
-        case BLE_GAP_EVENT_NOTIFY_RX:
+        case BLE_GAP_EVENT_NOTIFY_RX: { 
             int n_idx = find_node_by_handle(event->notify_rx.conn_handle);
             if (n_idx != -1 && event->notify_rx.attr_handle == nodes[n_idx].notify_handle) {
                 SHMData shm;
                 if (OS_MBUF_PKTLEN(event->notify_rx.om) == sizeof(SHMData)) { 
                     os_mbuf_copydata(event->notify_rx.om, 0, sizeof(SHMData), &shm);
                     
+                    printf("[SHM] Node %s | AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
+                           nodes[n_idx].mac_address, shm.ax, shm.ay, shm.az, shm.vbatt);
+                    
                     if (mqtt_connected) {
                         char json_payload[128];
+                        
+                        // === KEMBALIKAN FORMAT JSON DENGAN MAC ADDRESS ===
                         snprintf(json_payload, sizeof(json_payload), 
                                  "{\"node_mac\":\"%s\", \"ax\":%.2f, \"ay\":%.2f, \"az\":%.2f, \"vbatt\":%.2f}", 
                                  nodes[n_idx].mac_address, shm.ax, shm.ay, shm.az, shm.vbatt);
-                        esp_mqtt_client_publish(mqtt_client, "shm/telemetry", json_payload, 0, 0, 0);
+                                 
+                        // Publish ke topik MQTT
+                        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_payload, 0, 1, 0);
                     }
                 }
             }
             break;
+        }
     }
     return 0;
 }
@@ -510,7 +522,7 @@ void app_main(void) {
 
     nimble_port_init();
     
-    // PERTAHANKAN MTU 512 AGAR TRANSFER 256 BYTE MAKSIMAL
+    // PERTAHANKAN MTU 512 AGAR TRANSFER 500 BYTE MAKSIMAL
     ble_att_set_preferred_mtu(512); 
     
     ble_svc_gap_device_name_set("SHM_Gateway_S3");
