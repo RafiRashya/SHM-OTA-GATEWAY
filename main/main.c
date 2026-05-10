@@ -15,6 +15,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "cJSON.h"
 #include "secrets.h"
+#include "esp_wifi.h"
 
 #define MAX_NODES 3 
 
@@ -62,6 +63,13 @@ static const ble_uuid128_t ota_chr_ver_uuid = BLE_UUID128_INIT(
 
 static uint8_t own_addr_type; 
 static void ble_app_scan(void);
+
+static void get_gateway_mac(char *mac_str) {
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(mac_str, 18, "%02X:%02X:%02X:%02X:%02X:%02X", 
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
 // ==================== FUNGSI BANTUAN ====================
 static int find_node_by_handle(uint16_t conn_handle) {
@@ -131,6 +139,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             printf("\n[MQTT] Terhubung secara AMAN (TLS) ke EMQX!\n");
             mqtt_connected = true;
+
+            // === KIRIM STATUS ONLINE SAAT BERHASIL CONNECT ===
+            char gw_mac[18];
+            get_gateway_mac(gw_mac);
+            char online_payload[64];
+            snprintf(online_payload, sizeof(online_payload), "{\"status\":\"online\", \"gateway_mac\":\"%s\"}", gw_mac);
+            
+            esp_mqtt_client_publish(mqtt_client, "shm/gateway/status", online_payload, 0, 1, 1);
+            printf("[MQTT] Melaporkan Status Gateway: ONLINE\n");
+
             esp_mqtt_client_subscribe(mqtt_client, "shm/ota/trigger", 1);
             break;
 
@@ -188,6 +206,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 }
 
 static void mqtt_app_start(void) {
+    char gateway_mac[18];
+    get_gateway_mac(gateway_mac);
+
+    char lwt_payload[64];
+    snprintf(lwt_payload, sizeof(lwt_payload), "{\"status\":\"offline\", \"gateway_mac\":\"%s\"}", gateway_mac);
+
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
             .address.uri = MQTT_BROKER_URI,
@@ -196,6 +220,16 @@ static void mqtt_app_start(void) {
         .credentials = {
             .username = MQTT_USERNAME,
             .authentication.password = MQTT_PASSWORD,
+        },
+        .session = {
+            .keepalive = 10,
+            .last_will = {
+                .topic = "shm/gateway/status",
+                .msg = lwt_payload,
+                .msg_len = strlen(lwt_payload),
+                .qos = 1,
+                .retain = 1,
+            },
         },
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
