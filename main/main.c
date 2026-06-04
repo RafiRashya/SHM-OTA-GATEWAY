@@ -387,7 +387,24 @@ static int on_disc_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
         if (ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
             printf(">> Mengaktifkan Notifikasi SHM (Subscribe)...\n"); 
             uint8_t value[2] = {0x01, 0x00};
-            ble_gattc_write_flat(conn_handle, dsc->handle, value, sizeof(value), NULL, NULL);
+            
+            // 1. Logika Anti-Gagal: Ulangi jika radio sedang sibuk
+            int rc;
+            do {
+                rc = ble_gattc_write_flat(conn_handle, dsc->handle, value, sizeof(value), NULL, NULL);
+                if (rc == 6 || rc == 130) vTaskDelay(pdMS_TO_TICKS(10));
+            } while (rc == 6 || rc == 130);
+            
+            if (rc == 0) {
+                printf(">> Subscribe Sukses!\n");
+            } else {
+                printf(">> Subscribe Gagal (Error: %d)\n", rc);
+            }
+
+            if (!is_ota_running()) {
+                printf(">> Membuka gerbang pencarian untuk Node selanjutnya...\n");
+                ble_app_scan();
+            }
         }
     }
     return 0;
@@ -471,7 +488,6 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                              
                     printf("\n=== KONEKSI BLE BERHASIL! Node MAC: %s di slot %d ===\n", nodes[empty_idx].mac_address, empty_idx);
 
-                    // MTU Exchange dinonaktifkan agar tidak bertabrakan dengan Service Discovery
                     ble_gattc_exchange_mtu(event->connect.conn_handle, on_mtu_exchanged, NULL);
                     
                     if (strlen(verifying_mac) > 0 && strcmp(nodes[empty_idx].mac_address, verifying_mac) == 0) {
@@ -482,8 +498,8 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                     ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 }
 
-                if (!is_ota_running()) ble_app_scan();
             } else {
+                // Jika koneksi gagal, baru boleh scan lagi
                 if (!is_ota_running()) ble_app_scan();
             }
             break;
@@ -524,10 +540,34 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
 }
 
 static void ble_app_scan(void) {
+    // 1. CEK KAPASITAS: Jangan scan jika slot sudah penuh!
+    int active_nodes = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (nodes[i].is_active) active_nodes++;
+    }
+    
+    if (active_nodes >= MAX_NODES) {
+        printf(">> Kapasitas penuh (%d/%d Node). Scanner dimatikan untuk menghemat antena.\n", active_nodes, MAX_NODES);
+        return; 
+    }
+
     struct ble_gap_disc_params disc_params;
     memset(&disc_params, 0, sizeof(disc_params));
-    disc_params.filter_duplicates = 1; disc_params.passive = 0;
+    disc_params.filter_duplicates = 1; 
+    disc_params.passive = 0; // Harus 0 (Active) agar bisa membaca nama "SHM_Node_C3"
+    
+    // ========================================================================
+    // 2. ATUR NAFAS ANTENA (DUTY CYCLE 50% COEXISTENCE)
+    // Satuan itvl dan window adalah 0.625 ms.
+    // Interval 160 * 0.625 = 100 milidetik (Total siklus)
+    // Window   80 * 0.625  = 50 milidetik (Waktu aktif scan)
+    // Sisa 50ms akan otomatis diberikan ke Wi-Fi & Node yang sudah terkoneksi!
+    // ========================================================================
+    disc_params.itvl = 160;   
+    disc_params.window = 80;  
+
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event_cb, NULL);
+    printf(">> BLE Scanner dinyalakan (Mode Hemat Antena)...\n");
 }
 
 static void ble_app_on_sync(void) {
