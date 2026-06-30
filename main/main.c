@@ -17,12 +17,14 @@
 #include "secrets.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
+
 
 #define MAX_NODES 3 
 
 char current_ota_url[1024] = "";
 char target_ota_version[20] = "";
-char verifying_mac[18] = ""; 
+char rebooting_macs[MAX_NODES][18]; 
 
 // ================= STRUKTUR DATA ===================
 typedef struct __attribute__((packed)) {
@@ -41,9 +43,71 @@ typedef struct {
     uint16_t ota_ver_handle; 
     bool is_active;
     bool ota_in_progress;
+    bool is_verifying;
 } ConnectedNode;
 
 ConnectedNode nodes[MAX_NODES];
+
+// ==================== LED CONFIGURATION ====================
+// Pemetaan Pin LED (Sesuai Konfigurasi Solder Mahasiswa)
+#define LED_WIFI_PIN    GPIO_NUM_7   // LED Kuning 5mm
+#define LED_BLE_PIN     GPIO_NUM_10  // LED Biru 5mm
+#define LED_RGB_R_PIN   GPIO_NUM_39  // LED RGB Merah
+#define LED_RGB_G_PIN   GPIO_NUM_40  // LED RGB Hijau
+#define LED_RGB_B_PIN   GPIO_NUM_42  // LED RGB Biru (Disolder ke GPIO 42)
+
+// Inisialisasi GPIO LED
+void init_leds(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LED_WIFI_PIN) | 
+                        (1ULL << LED_BLE_PIN) | 
+                        (1ULL << LED_RGB_R_PIN) | 
+                        (1ULL << LED_RGB_G_PIN) | 
+                        (1ULL << LED_RGB_B_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+    // Setel kondisi awal semua LED mati (LOW)
+    gpio_set_level(LED_WIFI_PIN, 0);
+    gpio_set_level(LED_BLE_PIN, 0);
+    gpio_set_level(LED_RGB_R_PIN, 0);
+    gpio_set_level(LED_RGB_G_PIN, 0);
+    gpio_set_level(LED_RGB_B_PIN, 0);
+}
+
+// Fungsi bantu kendali warna RGB
+void set_fota_rgb_led(int r, int g, int b) {
+    gpio_set_level(LED_RGB_R_PIN, r);
+    gpio_set_level(LED_RGB_G_PIN, g);
+    gpio_set_level(LED_RGB_B_PIN, b);
+}
+
+// Task delayed turn-off untuk RGB LED (agar tidak memblokir NimBLE thread)
+static void rgb_off_timer_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(5000)); // Menyala selama 5 detik setelah sukses/gagal
+    set_fota_rgb_led(0, 0, 0);
+    vTaskDelete(NULL);
+}
+
+void trigger_rgb_off_delay(void) {
+    xTaskCreate(rgb_off_timer_task, "rgb_off", 2048, NULL, 5, NULL);
+}
+
+// Fungsi bantu hitung & perbarui status koneksi BLE
+void update_ble_led(void) {
+    int active_count = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (nodes[i].is_active) {
+            active_count++;
+        }
+    }
+    gpio_set_level(LED_BLE_PIN, active_count > 0 ? 1 : 0);
+}
+// ===========================================================
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
@@ -89,6 +153,19 @@ static void publish_ota_status(const char* mac, const char* status) {
         esp_mqtt_client_publish(mqtt_client, "shm/ota/status", payload, 0, 1, 0);
         printf("[MQTT] Melaporkan Status OTA Node %s: %s\n", mac, status);
     }
+
+    // Kendali LED RGB berdasarkan status FOTA
+    if (strcmp(status, "IN_PROGRESS") == 0) {
+        set_fota_rgb_led(0, 0, 1); // Biru (sedang transfer biner)
+    } else if (strcmp(status, "REBOOTING") == 0) {
+        set_fota_rgb_led(0, 0, 1); // Tetap Biru (atau kombinasi ungu/cyan)
+    } else if (strcmp(status, "SUCCESS") == 0) {
+        set_fota_rgb_led(0, 1, 0); // Hijau (sukses)
+        trigger_rgb_off_delay();   // Matikan setelah delay 5 detik
+    } else if (strcmp(status, "FAILED") == 0 || strcmp(status, "FAILED_ROLLBACK") == 0) {
+        set_fota_rgb_led(1, 0, 0); // Merah (gagal)
+        trigger_rgb_off_delay();   // Matikan setelah delay 5 detik
+    }
 }
 
 // CEK STATUS OTA GLOBAL UNTUK SISTEM DO NOT DISTURB
@@ -102,6 +179,12 @@ static bool is_ota_running(void) {
 // ==================== CALLBACK VERIFIKASI VERSI ====================
 static int read_version_cb(uint16_t conn_handle, const struct ble_gatt_error *error, 
                            struct ble_gatt_attr *attr, void *arg) {
+    int idx = find_node_by_handle(conn_handle);
+    printf("[VERIFIKASI] Callback read_version_cb dipanggil. conn_handle: %d, idx: %d, status: %d\n", conn_handle, idx, error->status);
+    if (idx == -1) return 0;
+    
+    printf("[VERIFIKASI] Status is_verifying pada slot %d: %d\n", idx, nodes[idx].is_verifying);
+
     if (error->status == 0) {
         char node_ver[20] = {0};
         int len = OS_MBUF_PKTLEN(attr->om);
@@ -110,10 +193,7 @@ static int read_version_cb(uint16_t conn_handle, const struct ble_gatt_error *er
         os_mbuf_copydata(attr->om, 0, len, node_ver);
         node_ver[len] = '\0'; 
 
-        int idx = find_node_by_handle(conn_handle);
-        if (idx == -1) return 0; 
-
-        if (strlen(verifying_mac) > 0 && strcmp(nodes[idx].mac_address, verifying_mac) == 0) {
+        if (nodes[idx].is_verifying) {
             printf("\n[VERIFIKASI] Node MAC %s melapor versi: '%s'\n", nodes[idx].mac_address, node_ver);
             char *n_ver = node_ver;
             char *t_ver = target_ota_version;
@@ -128,35 +208,39 @@ static int read_version_cb(uint16_t conn_handle, const struct ble_gatt_error *er
                 printf("[VERIFIKASI] GAGAL! Versi tidak sama.\n");
                 publish_ota_status(nodes[idx].mac_address, "FAILED_ROLLBACK");
             }
-            memset(verifying_mac, 0, sizeof(verifying_mac)); 
+            nodes[idx].is_verifying = false;
         }
     } else {
         printf("[VERIFIKASI] Gagal membaca versi GATT! Error: %d\n", error->status);
-        int idx = find_node_by_handle(conn_handle);
-        if (idx != -1) publish_ota_status(nodes[idx].mac_address, "FAILED_ROLLBACK");
-        memset(verifying_mac, 0, sizeof(verifying_mac));
+        publish_ota_status(nodes[idx].mac_address, "FAILED_ROLLBACK");
+        nodes[idx].is_verifying = false;
     }
     return 0;
 }
 
 // ==================== TASK VERIFIKASI (Tahan Banting) ====================
 void verify_version_task(void *pvParameter) {
-    int idx = (int)pvParameter;
+    int idx = (int)(intptr_t)pvParameter;
+    printf("[VERIFIKASI] Task verifikasi dimulai untuk slot %d (MAC: %s)\n", idx, nodes[idx].mac_address);
     
     int wait_time = 0;
-    // Tunggu dengan sabar sampai handle ditemukan oleh on_disc_chr (Maksimal 5 detik)
-    while(nodes[idx].ota_ver_handle == 0 && wait_time < 50) {
+    // Gunakan volatile cast agar compiler memuat ulang data dari RAM di setiap iterasi
+    while (((volatile ConnectedNode*)&nodes[idx])->ota_ver_handle == 0 && wait_time < 50) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_time++;
     }
 
-    if (nodes[idx].ota_ver_handle != 0) {
-        vTaskDelay(pdMS_TO_TICKS(500)); // Beri nafas sedikit agar discovery bersih
-        ble_gattc_read(nodes[idx].conn_handle, nodes[idx].ota_ver_handle, read_version_cb, NULL);
+    uint16_t ver_handle = ((volatile ConnectedNode*)&nodes[idx])->ota_ver_handle;
+    printf("[VERIFIKASI] Selesai menunggu. Handle versi: %d (wait_time: %d/50)\n", ver_handle, wait_time);
+
+    if (ver_handle != 0) {
+        vTaskDelay(pdMS_TO_TICKS(500)); // Beri jeda agar discovery stabil
+        int rc = ble_gattc_read(nodes[idx].conn_handle, ver_handle, read_version_cb, NULL);
+        printf("[VERIFIKASI] Eksekusi ble_gattc_read returned: %d\n", rc);
     } else {
         printf("[VERIFIKASI] Timeout! Gagal menemukan handle versi.\n");
         publish_ota_status(nodes[idx].mac_address, "FAILED_ROLLBACK");
-        memset(verifying_mac, 0, sizeof(verifying_mac)); 
+        nodes[idx].is_verifying = false;
     }
     vTaskDelete(NULL);
 }
@@ -260,8 +344,6 @@ static void mqtt_app_start(void) {
     esp_mqtt_client_start(mqtt_client);
 }
 
-// ==================== TASK OTA STREAMING ====================
-// ==================== TASK OTA STREAMING ====================
 void ota_download_and_send_task(void *pvParameters) {
     int idx = *((int*)pvParameters);
     free(pvParameters);
@@ -283,7 +365,6 @@ void ota_download_and_send_task(void *pvParameters) {
         .crt_bundle_attach = esp_crt_bundle_attach,
         .buffer_size = 8192,
         .buffer_size_tx = 2048,
-        // 1. PERBAIKAN: Naikkan timeout HTTP ke 30 detik & nyalakan Keep-Alive
         .timeout_ms = 30000, 
         .keep_alive_enable = true, 
     };
@@ -360,8 +441,13 @@ void ota_download_and_send_task(void *pvParameters) {
                 if (rc_end == 6 || rc_end == 130) vTaskDelay(pdMS_TO_TICKS(50));
             } while (rc_end == 6 || rc_end == 130);
 
-            strncpy(verifying_mac, nodes[idx].mac_address, sizeof(verifying_mac) - 1);
-            verifying_mac[sizeof(verifying_mac) - 1] = '\0';
+            // Tambahkan MAC ke daftar rebooting/verifikasi
+            for (int i = 0; i < MAX_NODES; i++) {
+                if (strlen(rebooting_macs[i]) == 0) {
+                    strncpy(rebooting_macs[i], nodes[idx].mac_address, 18);
+                    break;
+                }
+            }
             publish_ota_status(nodes[idx].mac_address, "REBOOTING");
         }
     } else {
@@ -381,29 +467,57 @@ void ota_download_and_send_task(void *pvParameters) {
 }
 
 // ==================== CALLBACK BLE GATT ====================
+typedef struct {
+    uint16_t conn_handle;
+    uint16_t dsc_handle;
+} subscribe_args_t;
+
+static void subscribe_task(void *pvParameters) {
+    subscribe_args_t *args = (subscribe_args_t *)pvParameters;
+    uint16_t conn_handle = args->conn_handle;
+    uint16_t dsc_handle = args->dsc_handle;
+    free(args);
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Beri jeda 100ms agar discovery selesai sepenuhnya
+
+    uint8_t value[2] = {0x01, 0x00};
+    int rc;
+    int retries = 0;
+    
+    do {
+        rc = ble_gattc_write_flat(conn_handle, dsc_handle, value, sizeof(value), NULL, NULL);
+        if (rc == 6 || rc == 130) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            retries++;
+        }
+    } while ((rc == 6 || rc == 130) && retries < 10);
+
+    if (rc == 0) {
+        printf(">> Subscribe Sukses!\n");
+    } else {
+        printf(">> Subscribe Gagal (Error: %d)\n", rc);
+    }
+    
+    if (!is_ota_running()) {
+        printf(">> Membuka gerbang pencarian untuk Node selanjutnya...\n");
+        ble_app_scan();
+    }
+    vTaskDelete(NULL);
+}
+
 static int on_disc_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg) {
     if (error->status == 0) {
         if (ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
             printf(">> Mengaktifkan Notifikasi SHM (Subscribe)...\n"); 
-            uint8_t value[2] = {0x01, 0x00};
             
-            // 1. Logika Anti-Gagal: Ulangi jika radio sedang sibuk
-            int rc;
-            do {
-                rc = ble_gattc_write_flat(conn_handle, dsc->handle, value, sizeof(value), NULL, NULL);
-                if (rc == 6 || rc == 130) vTaskDelay(pdMS_TO_TICKS(10));
-            } while (rc == 6 || rc == 130);
-            
-            if (rc == 0) {
-                printf(">> Subscribe Sukses!\n");
+            subscribe_args_t *args = malloc(sizeof(subscribe_args_t));
+            if (args != NULL) {
+                args->conn_handle = conn_handle;
+                args->dsc_handle = dsc->handle;
+                xTaskCreate(subscribe_task, "sub_task", 4096, args, 5, NULL);
             } else {
-                printf(">> Subscribe Gagal (Error: %d)\n", rc);
-            }
-
-            if (!is_ota_running()) {
-                printf(">> Membuka gerbang pencarian untuk Node selanjutnya...\n");
-                ble_app_scan();
+                printf(">> Gagal alokasi memori untuk task subscribe!\n");
             }
         }
     }
@@ -487,10 +601,21 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                              desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
                              
                     printf("\n=== KONEKSI BLE BERHASIL! Node MAC: %s di slot %d ===\n", nodes[empty_idx].mac_address, empty_idx);
+                    update_ble_led();
 
                     ble_gattc_exchange_mtu(event->connect.conn_handle, on_mtu_exchanged, NULL);
                     
-                    if (strlen(verifying_mac) > 0 && strcmp(nodes[empty_idx].mac_address, verifying_mac) == 0) {
+                    bool needs_verification = false;
+                    for (int i = 0; i < MAX_NODES; i++) {
+                        if (strlen(rebooting_macs[i]) > 0 && strcmp(nodes[empty_idx].mac_address, rebooting_macs[i]) == 0) {
+                            needs_verification = true;
+                            memset(rebooting_macs[i], 0, 18);
+                            break;
+                        }
+                    }
+                    
+                    if (needs_verification) {
+                        nodes[empty_idx].is_verifying = true;
                         xTaskCreate(verify_version_task, "verify_task", 4096, (void*)empty_idx, 5, NULL);
                     }
                 } else {
@@ -510,6 +635,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             if (idx != -1) {
                 memset(&nodes[idx], 0, sizeof(ConnectedNode)); 
             }
+            update_ble_led();
             // Jangan nyalakan scanner jika OTA sedang berjalan! (Fitur Do Not Disturb)
             if (!is_ota_running()) ble_app_scan();
             break;
@@ -588,14 +714,17 @@ void ble_host_task(void *param) {
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        gpio_set_level(LED_WIFI_PIN, 0); // Mati saat inisiasi koneksi
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_connected = false;
+        gpio_set_level(LED_WIFI_PIN, 0); // Mati saat terputus
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         printf("[WIFI] Terhubung! IP Address: " IPSTR "\n", IP2STR(&event->ip_info.ip));
         wifi_connected = true;
+        gpio_set_level(LED_WIFI_PIN, 1); // Menyala stabil saat mendapat IP
         if (mqtt_client == NULL) {
             mqtt_app_start();
         }
@@ -627,6 +756,9 @@ void wifi_init_sta(void) {
 void app_main(void) {
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
     printf("\n--- GATEWAY SHM ESP32-S3 (WIFI + SHM + OTA) ---\n");
+
+    // Inisialisasi LED GPIO
+    init_leds();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
